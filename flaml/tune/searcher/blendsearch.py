@@ -67,6 +67,8 @@ class BlendSearch(Searcher):
         lexico_objectives: Optional[dict] = None,
         use_incumbent_result_in_evaluation=False,
         allow_empty_config=False,
+        projection_config=None, # added
+        batch_num=0,  # added
     ):
         """Constructor.
 
@@ -204,6 +206,8 @@ class BlendSearch(Searcher):
         self._cat_hp_cost = cat_hp_cost or {}
         if space:
             add_cost_to_space(space, init_config, self._cat_hp_cost)
+        self.batch_num = batch_num  # added
+        self.projection_config = projection_config # added
         self._ls = self.LocalSearch(
             init_config,
             metric,
@@ -216,6 +220,8 @@ class BlendSearch(Searcher):
             self.cost_attr,
             seed,
             self.lexico_objectives,
+            self.projection_config,  # added
+            self.batch_num, # added
         )
         if global_search_alg is not None:
             self._gs = global_search_alg
@@ -477,6 +483,7 @@ class BlendSearch(Searcher):
                 self._result[signature] = result
                 # update target metric if improved
                 objective = result[self._ls.metric]
+                objective = min(objective) if isinstance(objective, list) else objective  # added
                 if (objective - self._metric_target) * self._ls.metric_op < 0:
                     self._metric_target = objective
                     if self._ls.resource:
@@ -510,9 +517,21 @@ class BlendSearch(Searcher):
                         del self._candidate_start_points[trial_id]
                     else:
                         self._started_from_low_cost = True
+
+                    print(f"Before _create_thread in on_trial_complete. ")   # added
                     self._create_thread(
                         config, result, self._subspace.get(trial_id, self._ls.space)
                     )
+                    # added
+                    # if self.projection_config:
+                    #     print('creating due to random projection.')
+                    #     while self._create_condition(result):
+                    #         for k in config.keys():
+                    #             config[k] = np.random.normal(0,1)
+
+                    #         self._create_thread(
+                    #         config, result, self._subspace.get(trial_id, self._ls.space)
+                    #     )
                 # reset admissible region to ls bounding box
                 self._gs_admissible_min.update(self._ls_bound_min)
                 self._gs_admissible_max.update(self._ls_bound_max)
@@ -526,6 +545,10 @@ class BlendSearch(Searcher):
             del self._subspace[trial_id]
 
     def _create_thread(self, config, result, space):
+        # TODO: use passed function to create random projection and return random projection
+        # also pass projection to flow2
+        print(f'Creating new thread {self._thread_count}') # added
+
         if self.lexico_objectives is None:
             obj = result[self._ls.metric]
         else:
@@ -776,13 +799,24 @@ class BlendSearch(Searcher):
                     self._ls.space,
                 )
             else:
-                self._update_admissible_region(
-                    config,
-                    self._ls_bound_min,
-                    self._ls_bound_max,
-                    space,
-                    self._ls.space,
-                )
+                # added
+                if isinstance(config, list):
+                    for c in config:
+                        self._update_admissible_region(
+                            c,
+                            self._ls_bound_min,
+                            self._ls_bound_max,
+                            space,
+                            self._ls.space,
+                        )
+                else:
+                    self._update_admissible_region(
+                        config,
+                        self._ls_bound_min,
+                        self._ls_bound_max,
+                        space,
+                        self._ls.space,
+                    )
                 self._gs_admissible_min.update(self._ls_bound_min)
                 self._gs_admissible_max.update(self._ls_bound_max)
             signature = self._ls.config_signature(config, space)

@@ -439,6 +439,7 @@ def run(
         **ray_args: keyword arguments to pass to ray.tune.run().
             Only valid when use_ray=True.
     """
+    print("**************************************Use Local FLAML**************************************")
     global _use_ray
     global _verbose
     global _running_trial

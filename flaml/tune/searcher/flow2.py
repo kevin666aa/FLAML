@@ -6,7 +6,9 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import logging
 from collections import defaultdict
-
+import torch # added
+import time # added
+from scipy.spatial import distance # added
 try:
     from ray import __version__ as ray_version
 
@@ -51,6 +53,8 @@ class FLOW2(Searcher):
         cost_attr: Optional[str] = "time_total_s",
         seed: Optional[int] = 20,
         lexico_objectives=None,
+        projection_config=None, # added
+        batch_num=0, # added
     ):
         """Constructor.
 
@@ -148,6 +152,61 @@ class FLOW2(Searcher):
         if space is not None:
             self._init_search()
 
+        # added
+        self.projection_config=projection_config
+        self.projection = None
+        if projection_config:
+            print(f'Will use random projection.')
+            self.projection = self.get_new_projection()
+        
+        self.batch_num = batch_num
+        if self.batch_num > 1:
+            print(f"Use batch search at each round with batch {self.batch_num}.")
+        self.last_move = None
+        self.previous_directions = []
+        self.buffer = []
+
+    # added
+    def get_new_projection(self):
+        return torch.normal(self.projection_config['mu'], self.projection_config["std"], 
+                                        (self.projection_config["in_dim"], self.projection_config['out_dim']))
+    # added
+    def switch_new_projection(self):
+        if not self.projection_config or self.trial_count_complete % 100 != 0:
+            return
+
+        new_projection = self.get_new_projection() # (500, 51200)
+        
+        # print(self.incumbent)
+
+        start = time.time()
+        new_projection_inv = torch.linalg.pinv(new_projection) # (51200, 500)
+        print(f"pseudo inv ended in {time.time() - start}s.")
+
+        x = torch.Tensor(list(self.best_config.values())[:-1])
+        new_x = (self.projection.T @ x) @ new_projection_inv
+        print(x[:10])
+        print((self.projection.T @ x)[:10])
+        print(new_x[:10])
+        print((new_projection.T @ new_x)[:10])
+        config = {}
+        # print(len(new_x))
+        for i in range(len(new_x)):
+            config[str(i)] = new_x[i]
+        config['projection'] = new_projection
+        self.best_config = config
+
+        self.incumbent = self.best_config
+        # self.incumbent = self.normalize(self.best_config)
+        self.projection = new_projection
+        
+        print(self.step)
+        # print(self._num_complete4incumbent )
+        # print(self._cost_complete4incumbent)
+        # print(self._num_proposedby_incumbent)
+        # print(self._num_allowed4incumbent)
+
+
     def _init_search(self):
         self._tunable_keys = []
         self._bounded_keys = []
@@ -197,8 +256,9 @@ class FLOW2(Searcher):
                 self._space_keys.append(self.resource_attr)
         else:
             self._resource = None
-        self.incumbent = {}
+        self.incumbent = {}        
         self.incumbent = self.normalize(self.best_config)  # flattened
+        self.incumbent = self.best_config
         self.best_obj = self.cost_incumbent = None
         self.dim = len(self._tunable_keys)  # total # tunable dimensions
         self._direction_tried = None
@@ -206,6 +266,7 @@ class FLOW2(Searcher):
         self._num_allowed4incumbent = 2 * self.dim
         self._proposed_by = {}  # trial_id: int -> incumbent: Dict
         self.step_ub = np.sqrt(self.dim)
+        # self.step_ub = np.sqrt(50*1024)
         self.step = self.STEPSIZE * self.step_ub
         lb = self.step_lower_bound
         if lb > self.step:
@@ -457,6 +518,84 @@ class FLOW2(Searcher):
                 else:
                     return False
 
+    # added
+    def my_on_trial_complete(
+        self, trial_id: str, result: Optional[Dict] = None, error: bool = False
+    ):
+        """
+        For batch search
+        """
+        self.trial_count_complete += 1
+        assert self.lexico_objectives is None, "There should be No lexico_objectives"
+        if not error and result:
+            obj = (result.get(self._metric))
+            if obj:
+                obj = (
+                    [
+                        obj[i] * self.metric_op for i in range(self.batch_num)
+                    ]
+                    if isinstance(obj, list)
+                    else obj * self.metric_op
+                )
+                
+                tmp_obj = obj[np.argmin(obj)] if isinstance(obj, list) else obj
+                
+                # self._configs[trial_id] = (batch_config, self.step)
+
+                if (
+                    self.best_obj is None
+                    or tmp_obj < self.best_obj
+                ):
+                    self.best_obj = tmp_obj
+                    self.best_config, self.step = self._configs[trial_id]
+                    if isinstance(obj, list):
+                        self.best_config = self.best_config[np.argmin(obj)] 
+
+                    self.incumbent = self.normalize(self.best_config)
+                    self.incumbent = self.best_config
+                    self.cost_incumbent = result.get(self.cost_attr, 1)
+                    if self._resource:
+                        self._resource = self.best_config[self.resource_attr]
+                    self._num_complete4incumbent = 0
+                    self._cost_complete4incumbent = 0
+                    self._num_proposedby_incumbent = 0
+                    self._num_allowed4incumbent = 2 * self.dim
+                    self._proposed_by.clear()
+                    if self._K > 0: # question
+                        self.step *= np.sqrt(self._K / self._oldK)
+                    self.step = min(self.step, self.step_ub)
+                    self._iter_best_config = self.trial_count_complete
+                    if self._trunc:
+                        self._trunc = min(self._trunc + 1, self.dim)
+
+                    self.switch_new_projection()
+                    return
+                elif self._trunc:
+                    self._trunc = max(self._trunc >> 1, 1)
+
+        self.switch_new_projection()
+
+        proposed_by = self._proposed_by.get(trial_id)
+        if proposed_by == self.incumbent:
+            self._num_complete4incumbent += 1
+            cost = (
+                result.get(self.cost_attr, 1)
+                if result
+                else self._trial_cost.get(trial_id)
+            )
+            if cost:
+                self._cost_complete4incumbent += cost
+            if (
+                self._num_complete4incumbent >= 2 * self.dim
+                and self._num_allowed4incumbent == 0
+            ):
+                self._num_allowed4incumbent = 2
+            if self._num_complete4incumbent == self.dir and (
+                not self._resource or self._resource == self.max_resource
+            ):
+                self._num_complete4incumbent -= 2
+                self._num_allowed4incumbent = max(self._num_allowed4incumbent, 2)
+
     def on_trial_complete(
         self, trial_id: str, result: Optional[Dict] = None, error: bool = False
     ):
@@ -465,6 +604,9 @@ class FLOW2(Searcher):
         If better, move, reset num_complete and num_proposed.
         If not better and num_complete >= 2*dim, num_allowed += 2.
         """
+        # added
+        if self.batch_num > 1:
+             return self.my_on_trial_complete(trial_id, result, error)
         self.trial_count_complete += 1
         if not error and result:
             obj = (
@@ -492,6 +634,7 @@ class FLOW2(Searcher):
                     self.best_obj = obj
                     self.best_config, self.step = self._configs[trial_id]
                     self.incumbent = self.normalize(self.best_config)
+                    self.incumbent = self.best_config # added
                     self.cost_incumbent = result.get(self.cost_attr, 1)
                     if self._resource:
                         self._resource = self.best_config[self.resource_attr]
@@ -500,15 +643,24 @@ class FLOW2(Searcher):
                     self._num_proposedby_incumbent = 0
                     self._num_allowed4incumbent = 2 * self.dim
                     self._proposed_by.clear()
-                    if self._K > 0:
+                    self.previous_directions.clear() # added
+                    self.buffer.clear()  # added
+                    if self._K > 0: 
                         self.step *= np.sqrt(self._K / self._oldK)
                     self.step = min(self.step, self.step_ub)
                     self._iter_best_config = self.trial_count_complete
                     if self._trunc:
                         self._trunc = min(self._trunc + 1, self.dim)
+                    self.switch_new_projection() # added
                     return
                 elif self._trunc:
                     self._trunc = max(self._trunc >> 1, 1)
+                else: 
+                    # added
+                    self.previous_directions.append((self.last_move, obj))
+
+        self.switch_new_projection()
+        
         proposed_by = self._proposed_by.get(trial_id)
         if proposed_by == self.incumbent:
             self._num_complete4incumbent += 1
@@ -532,6 +684,9 @@ class FLOW2(Searcher):
 
     def on_trial_result(self, trial_id: str, result: Dict):
         """Early update of incumbent."""
+        if self.batch_num > 1 :
+            return self.my_on_trial_result(trial_id, result)
+
         if result:
             obj = (
                 result.get(self._metric)
@@ -562,6 +717,7 @@ class FLOW2(Searcher):
                         if self._resource:
                             self._resource = config[self.resource_attr]
                         self.incumbent = self.normalize(self.best_config)
+                        self.incumbent = self.best_config # added
                         self.cost_incumbent = result.get(self.cost_attr, 1)
                         self._cost_complete4incumbent = 0
                         self._num_complete4incumbent = 0
@@ -572,6 +728,208 @@ class FLOW2(Searcher):
             cost = result.get(self.cost_attr, 1)
             # record the cost in case it is pruned and cost info is lost
             self._trial_cost[trial_id] = cost
+    
+    
+    # added
+    def my_on_trial_result(self, trial_id: str, result: Dict):
+        """Early update of incumbent."""
+        if result:
+            obj = result.get(self._metric)
+            if obj:
+                obj = (
+                    [
+                        obj[i] * self.metric_op for i in range(self.batch_num)
+                    ]
+                    if isinstance(obj, list)
+                    else obj * self.metric_op
+                )
+                
+                tmp_obj = obj[np.argmin(obj)] if isinstance(obj, list) else obj
+
+                if (
+                    self.best_obj is None
+                    or tmp_obj < self.best_obj
+                ):
+                    self.best_obj = tmp_obj
+                    config = self._configs[trial_id][0]
+                    self.best_config = config[np.argmin(obj)] if isinstance(config, list) else config
+                    self.incumbent = self.normalize(self.best_config)
+                    self.incumbent = self.best_config
+                    self.cost_incumbent = result.get(self.cost_attr, 1)
+                    if self._resource:
+                        self._resource = self.best_config[self.resource_attr]
+                    self._num_complete4incumbent = 0
+                    self._cost_complete4incumbent = 0
+                    self._num_proposedby_incumbent = 0
+                    self._num_allowed4incumbent = 2 * self.dim
+                    self._proposed_by.clear()
+                    self._iter_best_config = self.trial_count_complete
+            cost = result.get(self.cost_attr, 1)
+            # record the cost in case it is pruned and cost info is lost
+            self._trial_cost[trial_id] = cost
+
+    # added
+    def informed_rand_vector(self, dim):
+        if self.last_move is None:
+            return self.rand_vector_unit_sphere(dim)
+        best_vec = None
+        best_dist = -1
+        
+        for i in range(1000):
+            new_vec = self.rand_vector_unit_sphere(dim)
+            # print(self.last_move)
+            new_dist = distance.cosine(new_vec, self.last_move)
+            if new_dist < 1.8 and new_dist > best_dist:
+                best_dist = new_dist
+                best_vec = new_vec
+        if best_vec is None:
+            print("Couldn't find a suitable dict")
+            return self.rand_vector_unit_sphere(dim)
+        return best_vec
+    
+    # added
+    def rand_vector_by_value(self, dim):
+        # best_vec = None
+        # best_value = -1000000
+        if len(self.buffer) == 0:
+            for i in range(2000):
+                new_vec = self.rand_vector_unit_sphere(dim)
+                self.buffer.append((new_vec, self.vector_value(new_vec)))
+            self.buffer.sort(key=lambda x : -x[1])
+            best_vec = self.buffer[0][0]
+            self.buffer = self.buffer[1:]
+        else:
+            last_vec, last_loss = self.previous_directions[-1]
+            for i in range(len(self.buffer)):
+                # update previous loss
+                self.buffer[i] = (self.buffer[i][0], self.buffer[i][1]- last_loss/distance.cosine(self.buffer[i][0], last_vec)) 
+
+            for i in range(100):
+                new_vec = self.rand_vector_unit_sphere(dim)
+                self.buffer.append((new_vec, self.vector_value(new_vec)))
+            self.buffer.sort(key=lambda x : -x[1])
+            best_vec = self.buffer[0][0]
+            self.buffer = self.buffer[:-99]
+            self.buffer = self.buffer[1:]
+            print(len(self.buffer))
+
+        # for i in range(1000):
+        #     new_vec = self.rand_vector_unit_sphere(dim)
+        #     tmp_value = self.vector_value(new_vec)
+        #     if tmp_value > best_value:
+        #         print(tmp_value)
+        #         best_value = tmp_value
+        #         best_vec = new_vec
+        return best_vec
+    
+    # added
+    def vector_value(self, proposed):
+        value = 0
+        for (vec, loss) in self.previous_directions:
+            cdist = distance.cosine(proposed, vec)
+            value -= loss/cdist
+        return value
+
+
+    # added
+    def my_on_trial_result(self, trial_id: str, result: Dict):
+        """Early update of incumbent."""
+        if result:
+            obj = result.get(self._metric)
+            if obj:
+                obj = (
+                    [
+                        obj[i] * self.metric_op for i in range(self.batch_num)
+                    ]
+                    if isinstance(obj, list)
+                    else obj * self.metric_op
+                )
+                
+                tmp_obj = obj[np.argmin(obj)] if isinstance(obj, list) else obj
+
+                if (
+                    self.best_obj is None
+                    or tmp_obj < self.best_obj
+                ):
+                    self.best_obj = tmp_obj
+                    config = self._configs[trial_id][0]
+                    self.best_config = config[np.argmin(obj)] if isinstance(config, list) else config
+                    self.incumbent = self.normalize(self.best_config)
+                    self.incumbent = self.best_config
+                    self.cost_incumbent = result.get(self.cost_attr, 1)
+                    if self._resource:
+                        self._resource = self.best_config[self.resource_attr]
+                    self._num_complete4incumbent = 0
+                    self._cost_complete4incumbent = 0
+                    self._num_proposedby_incumbent = 0
+                    self._num_allowed4incumbent = 2 * self.dim
+                    self._proposed_by.clear()
+                    self._iter_best_config = self.trial_count_complete
+            cost = result.get(self.cost_attr, 1)
+            # record the cost in case it is pruned and cost info is lost
+            self._trial_cost[trial_id] = cost
+
+    # added
+    def informed_rand_vector(self, dim):
+        if self.last_move is None:
+            return self.rand_vector_unit_sphere(dim)
+        best_vec = None
+        best_dist = -1
+        
+        for i in range(1000):
+            new_vec = self.rand_vector_unit_sphere(dim)
+            # print(self.last_move)
+            new_dist = distance.cosine(new_vec, self.last_move)
+            if new_dist < 1.8 and new_dist > best_dist:
+                best_dist = new_dist
+                best_vec = new_vec
+        if best_vec is None:
+            print("Couldn't find a suitable dict")
+            return self.rand_vector_unit_sphere(dim)
+        return best_vec
+    
+    # added
+    def rand_vector_by_value(self, dim):
+        # best_vec = None
+        # best_value = -1000000
+        if len(self.buffer) == 0:
+            for i in range(2000):
+                new_vec = self.rand_vector_unit_sphere(dim)
+                self.buffer.append((new_vec, self.vector_value(new_vec)))
+            self.buffer.sort(key=lambda x : -x[1])
+            best_vec = self.buffer[0][0]
+            self.buffer = self.buffer[1:]
+        else:
+            last_vec, last_loss = self.previous_directions[-1]
+            for i in range(len(self.buffer)):
+                # update previous loss
+                self.buffer[i] = (self.buffer[i][0], self.buffer[i][1]- last_loss/distance.cosine(self.buffer[i][0], last_vec)) 
+
+            for i in range(100):
+                new_vec = self.rand_vector_unit_sphere(dim)
+                self.buffer.append((new_vec, self.vector_value(new_vec)))
+            self.buffer.sort(key=lambda x : -x[1])
+            best_vec = self.buffer[0][0]
+            self.buffer = self.buffer[:-99]
+            self.buffer = self.buffer[1:]
+            print(len(self.buffer))
+
+        # for i in range(1000):
+        #     new_vec = self.rand_vector_unit_sphere(dim)
+        #     tmp_value = self.vector_value(new_vec)
+        #     if tmp_value > best_value:
+        #         print(tmp_value)
+        #         best_value = tmp_value
+        #         best_vec = new_vec
+        return best_vec
+    
+    # added
+    def vector_value(self, proposed):
+        value = 0
+        for (vec, loss) in self.previous_directions:
+            cdist = distance.cosine(proposed, vec)
+            value -= loss/cdist
+        return value
 
     def rand_vector_unit_sphere(self, dim, trunc=0) -> np.ndarray:
         vec = self._random.normal(0, 1, dim)
@@ -580,6 +938,28 @@ class FLOW2(Searcher):
         mag = np.linalg.norm(vec)
         return vec / mag
 
+    # added
+    def propose_multi(self, dim):
+        batches = []
+        for _ in range(self.batch_num//2):
+            if len(batches) == 0:
+                batches.append(self.rand_vector_unit_sphere(dim))
+                continue
+
+            best_vec, best_dist = None, 100000000
+            for _ in range(200):
+                tmp_vec = self.rand_vector_unit_sphere(dim)
+                tmp_dist = sum(abs(1 - distance.cosine(b, tmp_vec)) for b in batches)
+                if tmp_dist < best_dist:
+                    # print(best_dist, tmp_dist)
+                    best_dist = tmp_dist
+                    best_vec = tmp_vec
+            batches.append(best_vec)
+        return batches
+
+
+            
+
     def suggest(self, trial_id: str) -> Optional[Dict]:
         """Suggest a new config, one of the following cases:
         1. same incumbent, increase resource.
@@ -587,6 +967,9 @@ class FLOW2(Searcher):
         3. same resource, move from the incumbent to the opposite direction.
         """
         # TODO: better decouple FLOW2 config suggestion and stepsize update
+        if self.batch_num > 1:
+            # print("Multi suggestion at one time.")
+            return self.suggest_multi(trial_id)
         self.trial_count_proposed += 1
         if (
             self._num_complete4incumbent > 0
@@ -601,20 +984,31 @@ class FLOW2(Searcher):
             return self._increase_resource(trial_id)
         self._num_allowed4incumbent -= 1
         move = self.incumbent.copy()
+        # if self._num_proposedby_incumbent >= 8:
+        #     tmp_direction = self.rand_vector_by_value(self.dim) * self.step
+        #     for i, key in enumerate(self._tunable_keys):
+        #         move[key] += tmp_direction[i]
+        #     self.last_move = tmp_direction
+        # else:
         if self._direction_tried is not None:
             # return negative direction
             for i, key in enumerate(self._tunable_keys):
                 move[key] -= self._direction_tried[i]
+            self.last_move = -self._direction_tried
             self._direction_tried = None
         else:
             # propose a new direction
             self._direction_tried = (
+                # self.informed_rand_vector(self.dim)* self.step
                 self.rand_vector_unit_sphere(self.dim, self._trunc) * self.step
             )
             for i, key in enumerate(self._tunable_keys):
                 move[key] += self._direction_tried[i]
-        self._project(move)
-        config = self.denormalize(move)
+            self.last_move = self._direction_tried
+
+        # self._project(move)
+        # config = self.denormalize(move)
+        config = move
         self._proposed_by[trial_id] = self.incumbent
         self._configs[trial_id] = (config, self.step)
         self._num_proposedby_incumbent += 1
@@ -646,12 +1040,15 @@ class FLOW2(Searcher):
             self._init_phase = False
             if self.step < self.step_lower_bound:
                 return None
-                # decrease step size
+            # decrease step size
             self._oldK = self._K or self._iter_best_config
             self._K = self.trial_count_proposed + 1
+            print(f'Old step: {self.step}')
             self.step *= np.sqrt(self._oldK / self._K)
+            print(f'new step: {self.step}')
         if self._init_phase:
             return unflatten_dict(config)
+            # return self.unflatten_add_projection(config)
         if self._trunc == 1 and self._direction_tried is not None:
             # random
             for i, key in enumerate(self._tunable_keys):
@@ -662,6 +1059,7 @@ class FLOW2(Searcher):
                         if generated["config"][key] != best_config[key]:
                             config[key] = generated["config"][key]
                             return unflatten_dict(config)
+                            # return self.unflatten_add_projection(config)
                         break
         elif len(config) == len(best_config):
             for key, value in best_config.items():
@@ -669,7 +1067,95 @@ class FLOW2(Searcher):
                     return unflatten_dict(config)
             # print('move to', move)
             self.incumbent = move
-        return unflatten_dict(config)
+        
+        return self.unflatten_add_projection(config)
+
+    # added
+    def suggest_multi(self, trial_id: str) -> Optional[Dict]:
+        """Suggest a new config, one of the following cases:
+        1. same incumbent, increase resource.
+        2. same resource, move from the incumbent to a random direction.
+        3. same resource, move from the incumbent to the opposite direction.
+        """
+        # suggest several at once
+
+        self.trial_count_proposed += self.batch_num
+        if (
+            self._num_complete4incumbent > 0
+            and self.cost_incumbent
+            and self._resource
+            and self._resource < self.max_resource
+            and (
+                self._cost_complete4incumbent
+                >= self.cost_incumbent * self.resource_multiple_factor
+            )
+        ):
+            return self._increase_resource(trial_id)
+        self._num_allowed4incumbent -= self.batch_num # 1?
+
+        batch_config = []
+        all_steps = self.propose_multi(self.dim)
+        for i in range(self.batch_num//2):
+            move1, move2 = self.incumbent.copy(), self.incumbent.copy()
+            
+            # tmp_step = self.rand_vector_unit_sphere(self.dim, self._trunc) * self.step
+            tmp_step = all_steps[i] * self.step
+            for i, key in enumerate(self._tunable_keys):
+                move1[key] += tmp_step[i]
+                move2[key] -= tmp_step[i]
+            # self._project(move1)
+            # self._project(move2)
+            # batch_config.append(self.denormalize(move1))
+            # batch_config.append(self.denormalize(move2))
+            batch_config.append(move1)
+            batch_config.append(move2)
+        self._proposed_by[trial_id] = self.incumbent
+        self._configs[trial_id] = (batch_config, self.step)
+        self._num_proposedby_incumbent += self.batch_num # + batch num?
+        best_config = self.best_config
+
+        config = batch_config[0]
+
+        if self._init_phase: # question
+            if self._direction_tried is None: # always none 
+                if self._same:
+                    same = not any(
+                        key not in best_config or value != best_config[key]
+                        for key, value in config.items()
+                    ) # question
+                    if same:
+                        # increase step size
+                        print("increase step size")
+                        self.step += self.STEPSIZE
+                        self.step = min(self.step, self.step_ub)
+            else:
+                same = not any(
+                    key not in best_config or value != best_config[key]
+                    for key, value in config.items()
+                )
+                self._same = same
+        if self._num_proposedby_incumbent >= self.dir and (
+            not self._resource or self._resource == self.max_resource
+        ):
+            # check stuck condition if using max resource
+            self._num_proposedby_incumbent = self.dir - self.batch_num
+            self._init_phase = False
+            if self.step < self.step_lower_bound:
+                return None
+            # decrease step size
+            self._oldK = self._K or self._iter_best_config
+            self._K = self.trial_count_proposed + 1
+            self.step *= np.sqrt(self._oldK / self._K)
+        
+        if self._init_phase:
+            return self.unflatten_multi_config(batch_config)
+        if len(config) == len(best_config):
+            for key, value in best_config.items():
+                if value != config[key]:
+                    return self.unflatten_multi_config(batch_config)
+            print("Caution: config same as best config.")
+            # self.incumbent = move
+        return self.unflatten_multi_config(batch_config)
 
     def _increase_resource(self, trial_id):
         # consider increasing resource using sum eval cost of complete
@@ -681,7 +1167,8 @@ class FLOW2(Searcher):
         config[self.resource_attr] = self._resource
         self._direction_tried = None
         self._configs[trial_id] = (config, self.step)
-        return unflatten_dict(config)
+        return unflatten_dict(config) 
+        # return self.unflatten_add_projection(config)
 
     def _project(self, config):
         """project normalized config in the feasible region and set resource_attr"""
@@ -700,6 +1187,9 @@ class FLOW2(Searcher):
 
     def config_signature(self, config, space: Dict = None) -> tuple:
         """Return the signature tuple of a config."""
+        # added
+        if isinstance(config, list):
+            config = config[0]
         config = flatten_dict(config)
         space = flatten_dict(space) if space else self._space
         value_list = []
